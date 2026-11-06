@@ -16,6 +16,9 @@ import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import org.springframework.web.server.ResponseStatusException
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
 
 @RestController
 class PlayerRestHandler(
@@ -27,6 +30,12 @@ class PlayerRestHandler(
 
     companion object {
         private val log = LoggerFactory.getLogger(PlayerRestHandler::class.java)
+
+        /**
+         * How long a voice update waits for its voice connection. Under the 10 seconds clients
+         * commonly wait for an answer, so they hear why rather than timing out themselves.
+         */
+        private const val VOICE_CONNECT_TIMEOUT_MS = 8_000L
     }
 
     val disabledFilters = serverConfig.filters.entries.filter { !it.value }.map { it.key }
@@ -125,7 +134,7 @@ class PlayerRestHandler(
                     context.koe.destroyConnection(guildId)
 
                     val conn = context.getMediaConnection(player)
-                    conn.connect(
+                    val connecting = conn.connect(
                         VoiceServerInfo.builder()
                             .setSessionId(it.sessionId)
                             .setEndpoint(it.endpoint)
@@ -134,7 +143,26 @@ class PlayerRestHandler(
                             .build()
                     ).exceptionally {
                         throw ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to connect to voice server")
-                    }.toCompletableFuture().join()
+                    }.toCompletableFuture()
+                    // A voice connection that never finishes (the network dropped while it was being
+                    // made) would otherwise keep this request thread and the player's lock forever:
+                    // every later voice update for the player waits behind it, each holding another
+                    // thread, until the server runs out of them. The wait is bounded instead, and the
+                    // unfinished connection is dropped so the client can simply try again.
+                    try {
+                        connecting.get(VOICE_CONNECT_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                    } catch (e: TimeoutException) {
+                        log.warn(
+                            "Voice connection for guild {} did not finish within {} ms, dropping it",
+                            guildId,
+                            VOICE_CONNECT_TIMEOUT_MS
+                        )
+                        context.koe.destroyConnection(guildId)
+                        throw ResponseStatusException(HttpStatus.GATEWAY_TIMEOUT, "Timed out connecting to voice server")
+                    } catch (e: ExecutionException) {
+                        throw e.cause as? ResponseStatusException
+                            ?: ResponseStatusException(HttpStatus.INTERNAL_SERVER_ERROR, "Failed to connect to voice server", e.cause)
+                    }
                     player.provideTo(conn)
                 }
             }
